@@ -7,7 +7,7 @@
 //! padding `u8`, `phase_lo: u32`, and `env_level: u16` (all little-endian). Every byte
 //! is verified with strict `assert_eq!` (0 tolerance).
 
-use sonix::{
+use cosmigo_sonix::{
     AccuracySynth, SonixContext, SonixVersion, SonixVoice, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS,
 };
 

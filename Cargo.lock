@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "sonix"
+name = "cosmigo-sonix"
 version = "0.1.0"

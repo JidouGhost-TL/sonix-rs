@@ -32,7 +32,7 @@
 //!
 //! ## Quickstart
 //! ```rust
-//! use sonix::{
+//! use cosmigo_sonix::{
 //!     AccuracySynth, SonixContext, SonixVersion, SonixVoice, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS,
 //! };
 //!

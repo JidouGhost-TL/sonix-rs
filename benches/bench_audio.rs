@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use sonix::{
+use cosmigo_sonix::{
     AccuracySynth, SonixContext, SonixSampleView, SonixVersion, SonixVoice, StudioSynth,
     SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS,
 };

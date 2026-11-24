@@ -7,7 +7,7 @@
 
 The **Cosmigo Sonix Sound System** powered **14 commercial Game Boy Advance ROMs** including *Ultimate Brain Games*, *Ultimate Card Games* (3 revisions), *Tron 2.0: Killer App* (USA & Europe), and eight 2-in-1 game packs (Shrek 2 + Shark Tale, Spider-Man + X2, Tony Hawk's Underground + Kelly Slater's Pro Surfer, Shrek 2 + Madagascar, and regional variants).
 
-`sonix` provides a clean-room, reverse-engineered implementation designed for audio preservation, DAWs, PC source ports, and emulators.
+`cosmigo-sonix` provides a clean-room, reverse-engineered implementation designed for audio preservation, DAWs, PC source ports, and emulators.
 
 > **Looking for a ready-to-use CLI?** You can scan GBA ROMs, extract WAV samples, and compile SoundFont 2.04 (.sf2) banks directly from the command line using our **[gbakit](https://github.com/JidouGhost-TL/gbakit)** toolkit (`gbakit audio scan`, `gbakit audio export`, `gbakit audio soundfont`).
 
@@ -43,7 +43,7 @@ The GSM voice codec bundled with the later releases is a separate streamed-speec
 ### Zero-Allocation Mixing (`#![no_std]`)
 
 ```rust
-use sonix::{AccuracySynth, SonixContext, SonixVersion, SonixVoice, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS};
+use cosmigo_sonix::{AccuracySynth, SonixContext, SonixVersion, SonixVoice, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS};
 
 let pcm: &[u8] = &[128, 160, 192, 224, 255, 224, 192, 160, 128, 96, 64, 32, 0, 32, 64, 96];
 let ctx = SonixContext::default();
