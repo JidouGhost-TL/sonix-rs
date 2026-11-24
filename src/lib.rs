@@ -6,18 +6,20 @@
 //! Covers all **14 commercial GBA ROMs** across **3 distinct releases** discovered in a
 //! full 3,377-ROM corpus audit:
 //! - [`SonixVersion::V109c`] (1 ROM: *Ultimate Brain Games*): earliest release, no GSM
-//!   voice codec, accumulator buffer at engine offset `0x358`.
+//!   voice codec, accumulator buffer at engine offset `0x358`, `>> 2` packed mix shift,
+//!   store mask `0xFFFF_3FFF`, accumulate mask `0x0003_0000`, clamp shift `>> 21`.
 //! - [`SonixVersion::V1096Gsm`] (11 ROMs: *Ultimate Card Games* (3 revisions) and eight
-//!   2-in-1 game packs): adds the GSM voice codec; mixer differs from `V109c` only in
-//!   register allocation.
+//!   2-in-1 game packs): adds the GSM voice codec; switches to `>> 3` packed mix shift,
+//!   store mask `0xFFFF_1FFF`, accumulate mask `0x0007_0000`, and clamp shift `>> 20`.
 //! - [`SonixVersion::V116Gsm`] (2 ROMs: *Tron 2.0: Killer App* USA & Europe): recompiled
-//!   mixer with a 4-byte larger engine header, accumulator buffer at engine offset `0x35C`.
+//!   mixer with a 4-byte larger engine header, accumulator buffer at engine offset `0x35C`,
+//!   and identical mixer math to `V1096Gsm`.
 //!
-//! All three releases share identical mixer math: unsigned 8-bit samples, a 64-bit
-//! phase accumulator (20-bit integer + fraction), packed `(s * vol) >> 3` dual-sample
-//! scaling with store/accumulate mask quirks, volume-envelope decay, loop wrap by
-//! repeated loop-length subtraction on phase carry, and a DC-bias saturating clamp
-//! (`clamp((acc >> 4) - total_volume, -128, 127)`).
+//! All three releases share the same core mixer architecture: unsigned 8-bit samples, a
+//! 64-bit phase accumulator (20-bit integer + fraction), packed `(s * vol) >> shift`
+//! dual-sample scaling with store/accumulate mask quirks, volume-envelope decay, loop
+//! wrap by repeated loop-length subtraction on phase carry, and a DC-bias saturating
+//! clamp.
 //!
 //! ## Features
 //! - **Zero dependencies** in `[dependencies]`, `#![no_std]` compatible, `#![deny(unsafe_code)]`.

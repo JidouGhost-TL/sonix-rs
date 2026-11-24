@@ -16,10 +16,12 @@ pub const SONIX_MAX_CHANNELS: usize = 24;
 /// Bias added to the 20-bit phase integer to form the ARM phase high word (`0xFFF0_0000`).
 pub const SONIX_PHASE_BIAS: u32 = 0xFFF0_0000;
 
-/// Packed-sample mask applied on the first-channel store path (`0xFFFF_1FFF`).
+/// Packed-sample mask applied on the first-channel store path for `V1096Gsm` / `V116Gsm`
+/// (`0xFFFF_1FFF`; `V109c` uses `0xFFFF_3FFF` via [`crate::SonixVersion::store_mask`]).
 pub const SONIX_STORE_MASK: u32 = 0xFFFF_1FFF;
 
-/// Packed-sample mask applied on the accumulate path (`0x0007_0000`, cleared via `bic`).
+/// Packed-sample mask applied on the accumulate path for `V1096Gsm` / `V116Gsm`
+/// (`0x0007_0000`, cleared via `bic`; `V109c` uses `0x0003_0000` via [`crate::SonixVersion::accum_mask`]).
 pub const SONIX_ACCUM_MASK: u32 = 0x0007_0000;
 
 /// Compute the DirectSound sample rate in Hz from a GBA Timer0 reload value (`TM0CNT_L`).
@@ -49,11 +51,17 @@ pub fn freq_to_step(freq_hz: f64, mix_rate_hz: f64, step_shift: u8) -> u32 {
     // so step = ratio * 2^(26 - shift).
     let shift = step_shift as i32;
     let exp = 26 - shift;
-    let scaled = if exp >= 0 {
-        (freq_hz / mix_rate_hz) * ((1u64 << exp) as f64)
+    let mut scaled = freq_hz / mix_rate_hz;
+    if exp >= 0 {
+        scaled *= (1u64 << exp) as f64;
     } else {
-        (freq_hz / mix_rate_hz) / ((1u64 << (-exp)) as f64)
-    };
+        let mut rem = -exp;
+        while rem >= 63 {
+            scaled /= (1u64 << 63) as f64;
+            rem -= 63;
+        }
+        scaled /= (1u64 << rem) as f64;
+    }
     if scaled >= (u32::MAX as f64) {
         u32::MAX
     } else if scaled <= 0.0 {
@@ -114,5 +122,11 @@ mod tests {
         assert_eq!(arm_lsl(1, 32), 0);
         assert_eq!(arm_lsr(0x8000_0000, 31), 1);
         assert_eq!(freq_to_step(22_050.0, 22_050.0, 10), 65_536);
+        // Edge cases: extreme step_shift must never panic with shift overflow.
+        assert_eq!(freq_to_step(22_050.0, 22_050.0, 255), 0);
+        assert_eq!(freq_to_step(22_050.0, 22_050.0, 90), 0);
+        assert_eq!(freq_to_step(f64::NAN, 22_050.0, 10), 0);
+        assert_eq!(freq_to_step(-100.0, 22_050.0, 10), 0);
+        assert_eq!(freq_to_step(22_050.0, 0.0, 10), 0);
     }
 }

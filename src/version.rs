@@ -2,15 +2,17 @@
 //!
 //! Auditing the full 3,377-ROM GBA corpus identifies **14 commercial ROMs** powered by the
 //! Cosmigo **Sonix Sound System** across **3 distinct releases**, all sharing the same
-//! ARM7TDMI packed-sample mixer core (64-bit phase, unsigned 8-bit samples, packed
-//! `(s * vol) >> 3` scaling, and a DC-bias saturating clamp):
+//! ARM7TDMI packed-sample mixer architecture (64-bit phase, unsigned 8-bit samples, packed
+//! `(s * vol) >> shift` scaling, and a DC-bias saturating clamp):
 //! - [`SonixVersion::V109c`] (1 ROM: *Ultimate Brain Games*): earliest release, no GSM
-//!   voice codec, accumulator buffer at engine offset `0x358`.
+//!   voice codec, accumulator buffer at engine offset `0x358`, `>> 2` mix shift, store mask
+//!   `0xFFFF_3FFF`, accumulate mask `0x0003_0000`, clamp shift `>> 21`.
 //! - [`SonixVersion::V1096Gsm`] (11 ROMs: *Ultimate Card Games* (3 revisions) and eight
-//!   2-in-1 game packs): adds the GSM voice codec; mixer differs from `V109c` only in
-//!   register allocation (9 instruction words).
+//!   2-in-1 game packs): adds the GSM voice codec; switches to `>> 3` mix shift, store mask
+//!   `0xFFFF_1FFF`, accumulate mask `0x0007_0000`, clamp shift `>> 20`.
 //! - [`SonixVersion::V116Gsm`] (2 ROMs: *Tron 2.0: Killer App* USA & Europe): recompiled
-//!   mixer with a 4-byte larger engine header; accumulator buffer at engine offset `0x35C`.
+//!   mixer with a 4-byte larger engine header; accumulator buffer at engine offset `0x35C`,
+//!   identical mixer math to `V1096Gsm`.
 
 use crate::freq::{SONIX_BLOCK_SIZE, SONIX_MAX_CHANNELS};
 
@@ -30,23 +32,23 @@ pub enum SonixVersion {
     ///
     /// - No GSM voice codec.
     /// - Accumulator buffer at engine offset `0x358`.
-    /// - Store-path packed mask held in `r1` (`mvn r1, #0xe000`).
+    /// - Packed mix shift `>> 2`, store mask `0xFFFF_3FFF`, accumulate mask
+    ///   `0x0003_0000`, clamp shift `>> 21`.
     V109c,
     /// Sonix Sound System v1.096 + GSM (11 ROMs: *Ultimate Card Games* (3 revisions),
     /// eight 2-in-1 game packs).
     ///
     /// - Adds the GSM voice codec.
     /// - Accumulator buffer at engine offset `0x358`.
-    /// - Store-path packed mask held in `sl` (`mvn sl, #0xe000`); mixer math is
-    ///   instruction-for-instruction identical to [`Self::V109c`] apart from
-    ///   register allocation (9 differing instruction words).
+    /// - Packed mix shift `>> 3`, store mask `0xFFFF_1FFF`, accumulate mask
+    ///   `0x0007_0000`, clamp shift `>> 20`.
     #[default]
     V1096Gsm,
     /// Sonix Sound System v1.16 + GSM (2 ROMs: *Tron 2.0: Killer App* USA & Europe).
     ///
     /// - GSM voice codec included.
     /// - Recompiled mixer with a 4-byte larger engine header; accumulator buffer
-    ///   at engine offset `0x35C`. Mixer math identical to the earlier releases.
+    ///   at engine offset `0x35C`. Mixer math identical to [`Self::V1096Gsm`].
     V116Gsm,
 }
 
@@ -215,5 +217,25 @@ mod tests {
         assert!(!SonixVersion::V109c.has_gsm());
         assert_eq!(SonixVersion::V109c.accumulator_offset(), 0x358);
         assert_eq!(SonixVersion::V116Gsm.accumulator_offset(), 0x35C);
+        assert_eq!(SonixVersion::V109c.mix_shift(), 2);
+        assert_eq!(SonixVersion::V109c.clamp_shift(), 21);
+        assert_eq!(SonixVersion::V1096Gsm.mix_shift(), 3);
+        assert_eq!(SonixVersion::V1096Gsm.clamp_shift(), 20);
+        assert_eq!(SonixVersion::V116Gsm.mix_shift(), 3);
+        assert_eq!(SonixVersion::V116Gsm.clamp_shift(), 20);
+
+        // Fallback mask-word detection when banner is absent.
+        let mut rom_mask = [0u8; 512];
+        rom_mask[0..64].copy_from_slice(&SONIX_MIXER_SIG);
+        rom_mask[0x108..0x10C].copy_from_slice(&V109C_MASK_WORD.to_le_bytes());
+        assert_eq!(
+            SonixVersion::detect_from_bytes(&rom_mask),
+            Some(SonixVersion::V109c)
+        );
+        rom_mask[0x108..0x10C].copy_from_slice(&V1096_MASK_WORD.to_le_bytes());
+        assert_eq!(
+            SonixVersion::detect_from_bytes(&rom_mask),
+            Some(SonixVersion::V1096Gsm)
+        );
     }
 }

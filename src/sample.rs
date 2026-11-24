@@ -23,7 +23,7 @@ pub const GBA_ROM_BUS_BASE: u32 = 0x0800_0000;
 ///
 /// The ARM sample fetch address is `base_addend_b + engine_bank_base + base_addend_a`
 /// plus the biased phase high word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SonixSampleDesc {
     /// First sample-address addend (`+0x00`).
     pub base_addend_a: u32,

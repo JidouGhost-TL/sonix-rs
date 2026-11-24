@@ -1,12 +1,13 @@
 //! Dual Synthesis Engines for the Cosmigo Sonix Sound System:
 //!
 //! - [`AccuracySynth`]: 100% bit-exact emulation of all three Sonix ARM7TDMI mixer
-//!   releases (`V109c`, `V1096Gsm`, `V116Gsm`, which share identical mixer math),
-//!   verified strictly byte-for-byte (`assert_eq!`, 0 tolerance) against headless
-//!   `libmgba.so.0.10` ARM7TDMI execution.
+//!   releases (`V109c` with `>> 2` / clamp `>> 21`, and `V1096Gsm` / `V116Gsm` with
+//!   `>> 3` / clamp `>> 20`), verified strictly byte-for-byte (`assert_eq!`, 0
+//!   tolerance) against headless `libmgba.so.0.10` ARM7TDMI execution.
 //! - [`StudioSynth`]: High-fidelity 48,000 Hz `f32` software synthesizer featuring a
 //!   compile-time 256-phase × 6-tap Lanczos-3 polyphase windowed-sinc LUT (or general
-//!   Lanczos-`a` fallback) and true equal-power stereo panning.
+//!   Lanczos-`a` fallback) with Q32.32 interior stepping and true equal-power stereo
+//!   panning.
 
 use crate::error::{Error, Result};
 use crate::freq::{arm_lsl, arm_lsr, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS, SONIX_PHASE_BIAS};
@@ -110,6 +111,20 @@ const fn build_lanczos3_lut() -> Lanczos3Table {
 
 static LANCZOS3_LUT: Lanczos3Table = build_lanczos3_lut();
 
+/// Compile-time 1 KiB L1-resident LUT mapping unsigned 8-bit PCM bytes (`0..=255`)
+/// to centred floating-point values `(b - 128) / 128` (`128 -> 0.0` exact).
+const fn build_u8_to_f32_lut() -> [f32; 256] {
+    let mut table = [0.0f32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = ((i as i32) - 128) as f32 * (1.0 / 128.0);
+        i += 1;
+    }
+    table
+}
+
+static U8_TO_F32: [f32; 256] = build_u8_to_f32_lut();
+
 // ============================================================================
 // AccuracySynth — 100% Bit-Exact ARM7TDMI Sonix Emulation
 // ============================================================================
@@ -141,9 +156,9 @@ impl Default for SonixContext {
 
 /// Byte-exact ARM7TDMI software mixer emulation for all three Sonix releases.
 ///
-/// The three releases share identical mixer math; they differ only in register
-/// allocation, engine header size, and GSM codec presence, none of which affect
-/// the mixed output bytes.
+/// Emulates the exact per-revision shifts and masks (`V109c`: `>> 2` / `0xFFFF_3FFF` /
+/// `0x0003_0000` / clamp `>> 21`; `V1096Gsm` & `V116Gsm`: `>> 3` / `0xFFFF_1FFF` /
+/// `0x0007_0000` / clamp `>> 20`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AccuracySynth;
 
@@ -172,6 +187,130 @@ impl AccuracySynth {
         }
     }
 
+    #[inline(always)]
+    fn mix_quad<const SHIFT: u32, const MASK: u32, const ACCUM: bool>(
+        dst: &mut [u32; 2],
+        p0: u32,
+        p1: u32,
+        eff_vol: u32,
+    ) {
+        if ACCUM {
+            let w0 = (p0.wrapping_mul(eff_vol) & !MASK) >> SHIFT;
+            let w1 = (p1.wrapping_mul(eff_vol) & !MASK) >> SHIFT;
+            dst[0] = dst[0].wrapping_add(w0);
+            dst[1] = dst[1].wrapping_add(w1);
+        } else {
+            let w0 = (p0.wrapping_mul(eff_vol) >> SHIFT) & MASK;
+            let w1 = (p1.wrapping_mul(eff_vol) >> SHIFT) & MASK;
+            dst[0] = w0;
+            dst[1] = w1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mix_channel_inner<const SHIFT: u32, const MASK: u32, const ACCUM: bool>(
+        acc: &mut [u32; SONIX_BLOCK_WORDS],
+        pcm: &[u8],
+        loop_len: u32,
+        eff_vol: u32,
+        mut hi: u32,
+        mut lo: u32,
+        step_hi: u32,
+        step_lo: u32,
+        n_quads: usize,
+    ) -> (u32, u32) {
+        let total_samples = n_quads * 4;
+        let phase64 = ((hi as u64) << 32) | (lo as u64);
+        let step64 = ((step_hi as u64) << 32) | (step_lo as u64);
+        let start_idx = hi.wrapping_sub(SONIX_PHASE_BIAS) as usize;
+        let acc_pairs = &mut acc.as_chunks_mut::<2>().0[..n_quads];
+
+        // Fast path 1: exact 1:1 pitch, fully in-bounds, zero phase carry across the block.
+        if step_hi == 1
+            && step_lo == 0
+            && hi >= SONIX_PHASE_BIAS
+            && (hi as u64) + (total_samples as u64) <= 0xFFFF_FFFF
+            && start_idx + total_samples <= pcm.len()
+        {
+            let src = &pcm[start_idx..start_idx + total_samples];
+            let (src_quads, _) = src.as_chunks::<4>();
+            for (dst, s) in acc_pairs.iter_mut().zip(src_quads.iter()) {
+                let p0 = (s[0] as u32) | ((s[1] as u32) << 16);
+                let p1 = (s[2] as u32) | ((s[3] as u32) << 16);
+                Self::mix_quad::<SHIFT, MASK, ACCUM>(dst, p0, p1, eff_vol);
+            }
+            hi = hi.wrapping_add(total_samples as u32);
+            return (hi, lo);
+        }
+
+        // Fast path 2: general fractional step, fully in-bounds, zero phase carry across the block.
+        let total_advance = (step64 as u128) * (total_samples as u128);
+        if hi >= SONIX_PHASE_BIAS && (phase64 as u128) + total_advance <= (u64::MAX as u128) {
+            let last_phase = phase64 + step64 * ((total_samples - 1) as u64);
+            let max_idx = ((last_phase >> 32) as u32).wrapping_sub(SONIX_PHASE_BIAS) as usize;
+            if max_idx < pcm.len() {
+                let bias64 = (SONIX_PHASE_BIAS as u64) << 32;
+                let mut rel = phase64 - bias64;
+                let step2 = step64.wrapping_mul(2);
+                let step3 = step64.wrapping_mul(3);
+                let step4 = step64.wrapping_mul(4);
+                let src = &pcm[..=max_idx];
+                for dst in acc_pairs.iter_mut() {
+                    let r0 = rel;
+                    let r1 = r0.wrapping_add(step64);
+                    let r2 = r0.wrapping_add(step2);
+                    let r3 = r0.wrapping_add(step3);
+                    rel = r0.wrapping_add(step4);
+
+                    let s0 = src[(r0 >> 32) as usize] as u32;
+                    let s1 = src[(r1 >> 32) as usize] as u32;
+                    let s2 = src[(r2 >> 32) as usize] as u32;
+                    let s3 = src[(r3 >> 32) as usize] as u32;
+
+                    let p0 = s0 | (s1 << 16);
+                    let p1 = s2 | (s3 << 16);
+                    Self::mix_quad::<SHIFT, MASK, ACCUM>(dst, p0, p1, eff_vol);
+                }
+                let final_phase = rel + bias64;
+                return ((final_phase >> 32) as u32, final_phase as u32);
+            }
+        }
+
+        // General path: handles loop wrap and past-end zero-fill.
+        let fetch = |hi: u32| -> u32 {
+            let idx = hi.wrapping_sub(SONIX_PHASE_BIAS) as usize;
+            if idx < pcm.len() {
+                pcm[idx] as u32
+            } else {
+                0
+            }
+        };
+
+        for dst in acc_pairs.iter_mut() {
+            let s0 = fetch(hi);
+            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
+            hi = h;
+            lo = l;
+            let s1 = fetch(hi);
+            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
+            hi = h;
+            lo = l;
+            let s2 = fetch(hi);
+            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
+            hi = h;
+            lo = l;
+            let s3 = fetch(hi);
+            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
+            hi = h;
+            lo = l;
+
+            let p0 = s0 | (s1 << 16);
+            let p1 = s2 | (s3 << 16);
+            Self::mix_quad::<SHIFT, MASK, ACCUM>(dst, p0, p1, eff_vol);
+        }
+        (hi, lo)
+    }
+
     /// Mix one Sonix channel into the 128-sample accumulator block.
     ///
     /// - `acc`: accumulator of 64 `u32` words, each holding two `i16` lanes.
@@ -180,8 +319,8 @@ impl AccuracySynth {
     /// - `voice`: channel state; phase and envelope level are updated in place.
     /// - `ctx`: engine masters and step-shift byte.
     /// - `accumulate`: `false` for the first channel in a block (ARM store path,
-    ///   `(packed * vol >> 3) & 0xFFFF_1FFF`), `true` for later channels (ARM
-    ///   accumulate path, `acc += (packed * vol & !0x7_0000) >> 3`).
+    ///   `(packed * vol >> shift) & store_mask`), `true` for later channels (ARM
+    ///   accumulate path, `acc += (packed * vol & !accum_mask) >> shift`).
     /// - `count`: samples to mix in this block (`1..=128`).
     ///
     /// Returns the channel's effective volume contribution to the block total.
@@ -211,103 +350,76 @@ impl AccuracySynth {
         }
 
         // 64-bit phase and step expansion.
-        let mut hi = voice.phase_hi();
-        let mut lo = voice.phase_lo_word();
+        let hi = voice.phase_hi();
+        let lo = voice.phase_lo_word();
         let shift_amt = (ctx.step_shift as u32) + 6;
         let step_lo = arm_lsl(voice.step, shift_amt);
         let step_hi = arm_lsr(voice.step, 32u32.wrapping_sub(shift_amt) & 0xFF);
-        // ARM `lsr` by (32 - shift_amt): when shift_amt > 32 the amount wraps;
-        // the helper already implements register-shift semantics for the
-        // wrapped amount computed above. For shift_amt == 0 (unreachable for
-        // byte step_shift, kept for completeness) the amount is 32 -> 0.
+        let n_quads = count.div_ceil(4);
 
-        let fetch = |hi: u32| -> u32 {
-            let idx = hi.wrapping_sub(SONIX_PHASE_BIAS) as usize;
-            if idx < pcm.len() {
-                pcm[idx] as u32
-            } else {
-                0
+        let (new_hi, new_lo) = match (version, accumulate) {
+            (SonixVersion::V109c, false) => Self::mix_channel_inner::<2, 0xFFFF_3FFF, false>(
+                acc, pcm, loop_len, eff_vol, hi, lo, step_hi, step_lo, n_quads,
+            ),
+            (SonixVersion::V109c, true) => Self::mix_channel_inner::<2, 0x0003_0000, true>(
+                acc, pcm, loop_len, eff_vol, hi, lo, step_hi, step_lo, n_quads,
+            ),
+            (SonixVersion::V1096Gsm | SonixVersion::V116Gsm, false) => {
+                Self::mix_channel_inner::<3, 0xFFFF_1FFF, false>(
+                    acc, pcm, loop_len, eff_vol, hi, lo, step_hi, step_lo, n_quads,
+                )
+            }
+            (SonixVersion::V1096Gsm | SonixVersion::V116Gsm, true) => {
+                Self::mix_channel_inner::<3, 0x0007_0000, true>(
+                    acc, pcm, loop_len, eff_vol, hi, lo, step_hi, step_lo, n_quads,
+                )
             }
         };
 
-        let mut word_idx = 0usize;
-        let mut remaining = count as i32;
-        while remaining > 0 {
-            // Fetch 4 samples with per-sample phase advance and loop wrap.
-            let s0 = fetch(hi);
-            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
-            hi = h;
-            lo = l;
-            let s1 = fetch(hi);
-            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
-            hi = h;
-            lo = l;
-            let s2 = fetch(hi);
-            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
-            hi = h;
-            lo = l;
-            let s3 = fetch(hi);
-            let (h, l) = Self::advance_phase(hi, lo, step_hi, step_lo, loop_len);
-            hi = h;
-            lo = l;
-
-            let packed0 = s0 | (s1 << 16);
-            let packed1 = s2 | (s3 << 16);
-            let shift = version.mix_shift();
-            if accumulate {
-                let w0 = (packed0.wrapping_mul(eff_vol) & !version.accum_mask()) >> shift;
-                let w1 = (packed1.wrapping_mul(eff_vol) & !version.accum_mask()) >> shift;
-                if word_idx < SONIX_BLOCK_WORDS {
-                    acc[word_idx] = acc[word_idx].wrapping_add(w0);
-                }
-                if word_idx + 1 < SONIX_BLOCK_WORDS {
-                    acc[word_idx + 1] = acc[word_idx + 1].wrapping_add(w1);
-                }
-            } else {
-                let w0 = (packed0.wrapping_mul(eff_vol) >> shift) & version.store_mask();
-                let w1 = (packed1.wrapping_mul(eff_vol) >> shift) & version.store_mask();
-                if word_idx < SONIX_BLOCK_WORDS {
-                    acc[word_idx] = w0;
-                }
-                if word_idx + 1 < SONIX_BLOCK_WORDS {
-                    acc[word_idx + 1] = w1;
-                }
-            }
-            word_idx += 2;
-            remaining -= 4;
-        }
-
-        voice.store_phase(hi, lo);
+        voice.store_phase(new_hi, new_lo);
         eff_vol
+    }
+
+    #[inline]
+    fn clamp_block_const<const SHIFT: u32>(
+        acc: &[u32; SONIX_BLOCK_WORDS],
+        total_volume: u16,
+        out: &mut [i8; SONIX_BLOCK_SIZE],
+    ) {
+        let neg_total = (total_volume as u32).wrapping_neg();
+        let neg_total_scaled = neg_total << SHIFT;
+        let low_min = -128i32 << SHIFT;
+        let low_max = 127i32 << SHIFT;
+        for i in 0..SONIX_BLOCK_WORDS {
+            let w = acc[i];
+            // Low i16 lane (even sample): scaled path.
+            let low_tmp = neg_total_scaled.wrapping_add(w << 16) as i32;
+            let low_clamped = low_tmp.clamp(low_min, low_max);
+            let low_byte = ((low_clamped as u32) >> SHIFT) as i8;
+            // High i16 lane (odd sample): direct path.
+            let high_val = neg_total.wrapping_add(w >> SHIFT) as i32;
+            let high_byte = high_val.clamp(-128, 127) as i8;
+            out[i * 2] = low_byte;
+            out[i * 2 + 1] = high_byte;
+        }
     }
 
     /// Clamp the 128-sample accumulator block into signed 8-bit DMA output.
     ///
     /// Mirrors the ARM clamp stage exactly, including its two different
-    /// scaling paths: even samples use the `((acc << 16) - (total << 20))`
-    /// scaled-clamp path, odd samples use the `(acc >> 20) - total` path.
-    /// Both compute `clamp((acc >> 4) - total_volume, -128, 127)` for in-range
-    /// accumulator values and saturate identically outside it.
+    /// scaling paths: even samples use the `((acc << 16) - (total << shift))`
+    /// scaled-clamp path, odd samples use the `(acc >> shift) - total` path.
     pub fn clamp_block(
         version: SonixVersion,
         acc: &[u32; SONIX_BLOCK_WORDS],
         total_volume: u16,
         out: &mut [i8; SONIX_BLOCK_SIZE],
     ) {
-        let shift = version.clamp_shift();
-        let neg_total = (total_volume as u32).wrapping_neg();
-        let neg_total_scaled = neg_total << shift;
-        for (pair, chunk) in acc.iter().enumerate() {
-            let w = *chunk;
-            // Low i16 lane (even sample): scaled path.
-            let low_tmp = neg_total_scaled.wrapping_add(w << 16) as i32;
-            let low_clamped = low_tmp.clamp(-128 << shift, 127 << shift);
-            let low_byte = (((low_clamped as u32) >> shift) & 0xFF) as u8 as i8;
-            // High i16 lane (odd sample): direct path.
-            let high_val = neg_total.wrapping_add(w >> shift) as i32;
-            let high_byte = high_val.clamp(-128, 127) as i8;
-            out[pair * 2] = low_byte;
-            out[pair * 2 + 1] = high_byte;
+        match version {
+            SonixVersion::V109c => Self::clamp_block_const::<21>(acc, total_volume, out),
+            SonixVersion::V1096Gsm | SonixVersion::V116Gsm => {
+                Self::clamp_block_const::<20>(acc, total_volume, out)
+            }
         }
     }
 
@@ -332,6 +444,10 @@ impl AccuracySynth {
         out: &mut [i8; SONIX_BLOCK_SIZE],
         count: usize,
     ) -> Result<u16> {
+        if channel_count == 0 {
+            Self::clamp_block(version, acc, 0, out);
+            return Ok(0);
+        }
         if first_index >= voices.len() || first_index >= samples.len() {
             return Err(Error::InvalidChannel(first_index));
         }
@@ -350,7 +466,7 @@ impl AccuracySynth {
             voices[index] = voice;
             total = total.wrapping_add(eff);
             first = false;
-            remaining = remaining.saturating_sub(1);
+            remaining -= 1;
             if remaining == 0 {
                 break;
             }
@@ -450,9 +566,9 @@ impl StudioSynth {
         }
         let pcm = &sample.pcm_bytes[..pcm_end];
         let pcm_len = pcm.len();
-        let loop_len = sample.loop_len();
-        let looped = loop_len > 0;
         let loop_start = sample.loop_start.unwrap_or(0) as usize;
+        let loop_len = sample.loop_len().min(pcm_len.saturating_sub(loop_start));
+        let looped = loop_len > 0;
         let loop_start_f = loop_start as f64;
         let loop_len_f = loop_len as f64;
         let pcm_len_f = pcm_len as f64;
@@ -460,51 +576,156 @@ impl StudioSynth {
         let out_l = &mut out_left[..frames];
         let out_r = &mut out_right[..frames];
 
-        let sample_at = |pcm: &[u8], idx: isize| -> f64 {
-            if idx < 0 || idx as usize >= pcm.len() {
-                0.0
-            } else {
-                ((pcm[idx as usize] as f64) - 128.0) / 128.0
-            }
-        };
-
         if self.sinc_lobes == 3 {
             let lut = &LANCZOS3_LUT.0;
+            let u8_lut = &U8_TO_F32;
             let mut ph = *pos_f64;
-            for idx in 0..frames {
-                if ph >= pcm_len_f {
-                    if looped {
-                        ph = loop_start_f + (ph - loop_start_f) % loop_len_f;
-                    } else {
-                        break;
-                    }
-                }
-                // ph is always >= 0 here, so truncation is floor.
-                let base = (ph as i64) as f64;
-                let frac = ph - base;
-                let base_i = base as isize;
-                let phase = (frac * (LANCZOS_PHASES as f64)) as usize;
-                let weights = &lut[phase.min(LANCZOS_PHASES - 1)];
-                let mut acc = 0.0f64;
-                if base_i >= 2 && (base_i as usize) + 4 < pcm_len {
-                    // Interior fast path: all six taps are in range.
-                    for (t, &w) in weights.iter().take(LANCZOS3_TAPS).enumerate() {
-                        let k = (t as isize) - 2;
-                        let s = ((pcm[(base_i + k) as usize] as f64) - 128.0) / 128.0;
-                        acc += (w as f64) * s;
-                    }
+
+            // Fast Q32.32 fixed-point interior-segment renderer when indices and step
+            // fit comfortably inside 30-bit integer range (always true for GBA PCM).
+            const Q32_SCALE: f64 = 4_294_967_296.0;
+            const Q32_INV: f64 = 1.0 / Q32_SCALE;
+            if pcm_len < (1usize << 30)
+                && ph < (1u64 << 30) as f64
+                && step < (1u64 << 29) as f64
+            {
+                let mut pos_q = (ph * Q32_SCALE) as u64;
+                let step_q = (step * Q32_SCALE) as u64;
+                let step_q2 = step_q.wrapping_mul(2);
+                let step_q3 = step_q.wrapping_mul(3);
+                let step_q4 = step_q.wrapping_mul(4);
+                let pcm_len_q = (pcm_len as u64) << 32;
+                let loop_start_q = (loop_start as u64) << 32;
+                let loop_len_q = (loop_len as u64) << 32;
+                let max_interior_q = if pcm_len >= 6 {
+                    (((pcm_len - 4) as u64) << 32) | 0xFFFF_FFFF
                 } else {
-                    for (t, &w) in weights.iter().take(LANCZOS3_TAPS).enumerate() {
-                        let k = (t as isize) - 2;
-                        acc += (w as f64) * sample_at(pcm, base_i + k);
+                    0
+                };
+
+                #[inline(always)]
+                fn eval_interior(
+                    pcm: &[u8],
+                    lut: &[[f32; 8]; LANCZOS_PHASES],
+                    u8_lut: &[f32; 256],
+                    p: u64,
+                ) -> f32 {
+                    let b = (p >> 32) as usize;
+                    let w = &lut[((p >> 24) & 0xFF) as usize];
+                    let s = &pcm[b - 2..b + 4];
+                    let t0 = u8_lut[s[0] as usize];
+                    let t1 = u8_lut[s[1] as usize];
+                    let t2 = u8_lut[s[2] as usize];
+                    let t3 = u8_lut[s[3] as usize];
+                    let t4 = u8_lut[s[4] as usize];
+                    let t5 = u8_lut[s[5] as usize];
+                    ((w[0] * t0 + w[1] * t1) + (w[2] * t2 + w[3] * t3))
+                        + (w[4] * t4 + w[5] * t5)
+                }
+
+                let mut idx = 0usize;
+                while idx < frames {
+                    if pos_q >= pcm_len_q {
+                        if looped {
+                            pos_q = loop_start_q + (pos_q - loop_start_q) % loop_len_q;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let base = (pos_q >> 32) as usize;
+                    if pcm_len >= 6 && base >= 2 && pos_q <= max_interior_q {
+                        // Interior fast run: all 6 taps in `base - 2..base + 4` are guaranteed
+                        // in-bounds with zero loop-wrap checks.
+                        let remaining = frames - idx;
+                        let run = (max_interior_q - pos_q)
+                            .checked_div(step_q)
+                            .map_or(remaining, |n| (n + 1).min(remaining as u64) as usize);
+                        let (chunks_l, rem_l) = out_l[idx..idx + run].as_chunks_mut::<4>();
+                        let (chunks_r, rem_r) = out_r[idx..idx + run].as_chunks_mut::<4>();
+                        for (cl, cr) in chunks_l.iter_mut().zip(chunks_r.iter_mut()) {
+                            let p0 = pos_q;
+                            let p1 = p0.wrapping_add(step_q);
+                            let p2 = p0.wrapping_add(step_q2);
+                            let p3 = p0.wrapping_add(step_q3);
+                            pos_q = p0.wrapping_add(step_q4);
+
+                            let a0 = eval_interior(pcm, lut, u8_lut, p0);
+                            let a1 = eval_interior(pcm, lut, u8_lut, p1);
+                            let a2 = eval_interior(pcm, lut, u8_lut, p2);
+                            let a3 = eval_interior(pcm, lut, u8_lut, p3);
+
+                            cl[0] += a0 * gain_l;
+                            cr[0] += a0 * gain_r;
+                            cl[1] += a1 * gain_l;
+                            cr[1] += a1 * gain_r;
+                            cl[2] += a2 * gain_l;
+                            cr[2] += a2 * gain_r;
+                            cl[3] += a3 * gain_l;
+                            cr[3] += a3 * gain_r;
+                        }
+                        for (ol, or) in rem_l.iter_mut().zip(rem_r.iter_mut()) {
+                            let acc = eval_interior(pcm, lut, u8_lut, pos_q);
+                            *ol += acc * gain_l;
+                            *or += acc * gain_r;
+                            pos_q = pos_q.wrapping_add(step_q);
+                        }
+                        idx += run;
+                    } else {
+                        // Boundary sample (near start or end of PCM).
+                        let phase = ((pos_q >> 24) & 0xFF) as usize;
+                        let w = &lut[phase];
+                        let base_i = base as isize;
+                        let mut acc = 0.0f32;
+                        for (t, &wt) in w.iter().take(LANCZOS3_TAPS).enumerate() {
+                            let si = base_i + (t as isize) - 2;
+                            if si >= 0 && (si as usize) < pcm_len {
+                                acc += wt * u8_lut[pcm[si as usize] as usize];
+                            }
+                        }
+                        out_l[idx] += acc * gain_l;
+                        out_r[idx] += acc * gain_r;
+                        pos_q = pos_q.wrapping_add(step_q);
+                        idx += 1;
                     }
                 }
-                out_l[idx] += (acc as f32) * gain_l;
-                out_r[idx] += (acc as f32) * gain_r;
-                ph += step;
+                *pos_f64 = (pos_q as f64) * Q32_INV;
+            } else {
+                // Fallback for extreme (> 2^30) positions or steps.
+                for idx in 0..frames {
+                    if ph >= pcm_len_f {
+                        if looped {
+                            ph = loop_start_f + (ph - loop_start_f) % loop_len_f;
+                        } else {
+                            break;
+                        }
+                    }
+                    let base = (ph as i64) as f64;
+                    let frac = ph - base;
+                    let base_i = base as isize;
+                    let phase = ((frac * (LANCZOS_PHASES as f64)) as usize).min(LANCZOS_PHASES - 1);
+                    let w = &lut[phase];
+                    let mut acc = 0.0f32;
+                    for (t, &wt) in w.iter().take(LANCZOS3_TAPS).enumerate() {
+                        let si = base_i + (t as isize) - 2;
+                        if si >= 0 && (si as usize) < pcm_len {
+                            acc += wt * u8_lut[pcm[si as usize] as usize];
+                        }
+                    }
+                    out_l[idx] += acc * gain_l;
+                    out_r[idx] += acc * gain_r;
+                    ph += step;
+                }
+                *pos_f64 = ph;
             }
-            *pos_f64 = ph;
         } else {
+            let sample_at = |pcm: &[u8], idx: isize| -> f64 {
+                if idx < 0 || idx as usize >= pcm.len() {
+                    0.0
+                } else {
+                    ((pcm[idx as usize] as f64) - 128.0) / 128.0
+                }
+            };
             let a = self.sinc_lobes as f64;
             let taps = self.sinc_lobes * 2;
             let mut ph = *pos_f64;
@@ -537,5 +758,93 @@ impl StudioSynth {
             }
             *pos_f64 = ph;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_synth_silence_is_exact_zero() {
+        let pcm = [128u8; 256];
+        let view = SonixSampleView::from_pcm_bytes(22_050, 60, Some(16), Some(256), &pcm);
+        let studio = StudioSynth::default();
+        let mut out_l = [0.0f32; 512];
+        let mut out_r = [0.0f32; 512];
+        let mut pos = 0.0;
+        studio.render_voice_f32(&view, &mut pos, 22_050.0, 1.0, 0.0, &mut out_l, &mut out_r);
+        assert!(out_l.iter().all(|&x| x == 0.0));
+        assert!(out_r.iter().all(|&x| x == 0.0));
+        assert!(pos > 0.0);
+    }
+
+    #[test]
+    fn studio_synth_oneshot_stops_and_malformed_loop_safe() {
+        let pcm = [200u8; 8];
+        let view = SonixSampleView::from_pcm_bytes(22_050, 60, None, None, &pcm);
+        let studio = StudioSynth::default();
+        let mut out_l = [0.0f32; 64];
+        let mut out_r = [0.0f32; 64];
+        let mut pos = 0.0;
+        studio.render_voice_f32(&view, &mut pos, 48_000.0, 1.0, -1.0, &mut out_l, &mut out_r);
+        // Hard-left pan: right channel stays ~0, left channel has signal for the first 8 frames.
+        assert!(out_l[4] > 0.4);
+        assert_eq!(out_l[20], 0.0);
+        assert!(out_r.iter().all(|&x| x.abs() < 1e-6));
+
+        // Malformed loop_start >= pcm.len() must not panic or produce NaN.
+        let bad = SonixSampleView {
+            pcm_bytes: &pcm,
+            sample_rate_hz: 22_050,
+            root_key: 60,
+            loop_len: 100,
+            loop_start: Some(500),
+            loop_end: Some(600),
+        };
+        let mut pos2 = 0.0;
+        studio.render_voice_f32(&bad, &mut pos2, 48_000.0, 1.0, 0.0, &mut out_l, &mut out_r);
+        assert!(out_l.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn studio_synth_general_lobes_fallback() {
+        let pcm: [u8; 64] = core::array::from_fn(|i| ((i * 4) & 0xFF) as u8);
+        let view = SonixSampleView::from_pcm_bytes(22_050, 60, Some(8), Some(64), &pcm);
+        let studio = StudioSynth {
+            sample_rate: 48_000,
+            sinc_lobes: 2,
+        };
+        let mut out_l = [0.0f32; 32];
+        let mut out_r = [0.0f32; 32];
+        let mut pos = 4.25;
+        studio.render_voice_f32(&view, &mut pos, 22_050.0, 0.5, 0.25, &mut out_l, &mut out_r);
+        assert!(out_l.iter().any(|&x| x != 0.0));
+        assert!(out_l.iter().all(|x| x.is_finite()));
+        assert!(out_r.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn render_block_zero_channels_clamps_to_zero() {
+        let mut voices = [SonixVoice::silent(); 2];
+        let pcm = [128u8; 16];
+        let samples: [(&[u8], u32); 2] = [(&pcm, 0), (&pcm, 0)];
+        let ctx = SonixContext::default();
+        let mut acc = [0u32; SONIX_BLOCK_WORDS];
+        let mut out = [99i8; SONIX_BLOCK_SIZE];
+        let total = AccuracySynth::render_block(
+            SonixVersion::V116Gsm,
+            &mut voices,
+            &samples,
+            0,
+            0,
+            &ctx,
+            &mut acc,
+            &mut out,
+            SONIX_BLOCK_SIZE,
+        )
+        .expect("zero channels ok");
+        assert_eq!(total, 0);
+        assert!(out.iter().all(|&b| b == 0));
     }
 }
