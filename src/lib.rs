@@ -29,6 +29,32 @@
 //!     true equal-power stereo panning.
 //! - **Byte-exact `libmgba` ARM golden tested**: every output byte and updated voice
 //!   phase verified strictly byte-for-byte (`assert_eq!`) across all three releases.
+//!
+//! ## Quickstart
+//! ```rust
+//! use sonix::{
+//!     AccuracySynth, SonixContext, SonixVersion, SonixVoice, SONIX_BLOCK_SIZE, SONIX_BLOCK_WORDS,
+//! };
+//!
+//! let pcm: &[u8] = &[128, 160, 192, 224, 255, 224, 192, 160, 128, 96, 64, 32, 0, 32, 64, 96];
+//! let ctx = SonixContext::default();
+//! let mut voice = SonixVoice::new_simple(64, 200, 0x0001_0000);
+//! let mut acc = [0u32; SONIX_BLOCK_WORDS];
+//! let mut out = [0i8; SONIX_BLOCK_SIZE];
+//!
+//! let total = AccuracySynth::mix_channel(
+//!     SonixVersion::V116Gsm,
+//!     &mut acc,
+//!     pcm,
+//!     0,
+//!     &mut voice,
+//!     &ctx,
+//!     false,
+//!     SONIX_BLOCK_SIZE,
+//! );
+//! AccuracySynth::clamp_block(SonixVersion::V116Gsm, &acc, total as u16, &mut out);
+//! assert!(out.iter().any(|&s| s != 0));
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]

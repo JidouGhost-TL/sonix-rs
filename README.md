@@ -2,7 +2,7 @@
 
 **Zero-dependency, pure Rust parser, software synthesizer, and byte-exact golden-tested emulator for the Cosmigo Sonix Sound System (Game Boy Advance).**
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![no_std](https://img.shields.io/badge/no__std-compatible-success.svg)](#features)
 
 The **Cosmigo Sonix Sound System** powered **14 commercial Game Boy Advance ROMs** including *Ultimate Brain Games*, *Ultimate Card Games* (3 revisions), *Tron 2.0: Killer App* (USA & Europe), and eight 2-in-1 game packs (Shrek 2 + Shark Tale, Spider-Man + X2, Tony Hawk's Underground + Kelly Slater's Pro Surfer, Shrek 2 + Madagascar, and regional variants).
@@ -61,7 +61,22 @@ AccuracySynth::clamp_block(SonixVersion::V116Gsm, &acc, total as u16, &mut out);
 
 Every mixing path in `AccuracySynth` is verified strictly byte-for-byte (`assert_eq!`, zero tolerance) against real ARM7TDMI execution traces captured in headless `libmgba.so.0.10` using clean-room synthetic deterministic waveforms:
 
-- **7 test vectors × 3 revisions (2,688 DMA bytes + phase/envelope/total state)**: 1:1 pitch, fractional resampling (1.5× step), loop wrap at the 1 MiB phase boundary, two-channel store + accumulate mixing, volume-envelope decay, alternating-extrema saturation, and past-end zero-fill behaviour.
+- **7 test vectors × 3 revisions (21 golden files, 2,688 DMA bytes + phase/envelope/total state)**: 1:1 pitch, fractional resampling (1.5× step), loop wrap at the 1 MiB phase boundary, two-channel store + accumulate mixing, volume-envelope decay, alternating-extrema saturation, and past-end zero-fill behaviour.
+
+---
+
+## Benchmarks
+
+```sh
+cargo bench --bench bench_audio
+```
+
+| Benchmark | Throughput |
+|---|---:|
+| `AccuracySynth::mix_channel` (store, 128f) | ~2.96 GSamples/s |
+| `AccuracySynth::mix_channel` (accum, 128f) | ~2.19 GSamples/s |
+| `AccuracySynth::clamp_block` (128f) | ~3.77 GSamples/s |
+| `StudioSynth::render_voice_f32` (48 kHz Lanczos-3, 1,024f) | ~504 MSamples/s |
 
 ---
 
